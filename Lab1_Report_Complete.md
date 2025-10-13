@@ -440,10 +440,20 @@ def build_directory_html(self, url_path, dirs, files):
 
 ### 9.1 Network Setup and Discovery
 
-**Find Local IP Address:**
+**Network Configuration (ZeroTier VPN):**
+```
+Available Network Interfaces:
+- Local Wi-Fi: 192.168.1.112 (local network only)
+- ZeroTier VPN: 169.254.229.90 (virtual network for friend connections)
+- WSL Hyper-V: 172.30.224.1 (Windows Subsystem for Linux)
+```
+
+**Find Network IP Addresses:**
 ```powershell
-ipconfig | findstr "IPv4"
-# Result: 192.168.1.112
+ipconfig
+# Key Results:
+# Wi-Fi: 192.168.1.112 (local network)
+# ZeroTier: 169.254.229.90 (VPN network for friends)
 ```
 
 **Configure Windows Firewall:**
@@ -453,45 +463,110 @@ netsh advfirewall firewall add rule name="HTTP File Server" dir=in action=allow 
 
 **Server Network Configuration:**
 ```python
-# Server binds to all network interfaces
+# Server binds to all network interfaces (0.0.0.0)
 def __init__(self, host='0.0.0.0', port=8080, root_dir='./content'):
-    self.host = host  # 0.0.0.0 = all interfaces
+    self.host = host  # 0.0.0.0 = all interfaces (local + ZeroTier)
     self.port = port
 ```
 
 ### 9.2 Network Access Testing
 
-**Local Network Access:**
-- Server accessible at: `http://192.168.1.112:8080`
-- Docker configured for host networking
-- Firewall rule allows incoming connections on port 8080
+**Multiple Network Access Points:**
+- **Local Network:** `http://192.168.1.112:8080` (Wi-Fi - same router)
+- **ZeroTier VPN:** `http://169.254.229.90:8080` (Virtual network - friends anywhere)
+- **Localhost:** `http://localhost:8080` (local testing)
 
-**Network Client Testing:**
+**Docker Host Networking:**
+- Docker configured for host networking to access all interfaces
+- Server binds to `0.0.0.0:8080` making it available on all network adapters
+
+**ZeroTier Network Testing:**
 ```bash
-# Download from network IP instead of localhost
-python client.py 192.168.1.112 8080 /subdirectory/book1.pdf ./downloads
+# Test local access first
+python client.py localhost 8080 /index.html ./downloads
+
+# Test via local Wi-Fi network
+python client.py 192.168.1.112 8080 /index.html ./downloads
+
+# Test via ZeroTier VPN (for friends)
+python client.py 169.254.229.90 8080 /index.html ./downloads
 ```
 
-**Cross-Network File Sharing:**
+**Cross-Network File Sharing via ZeroTier:**
 ```bash
-# Example: Download from friend's server at 192.168.1.50
-python client.py 192.168.1.50 8080 /subdirectory/book2.pdf ./content
-# Now your server serves their book too!
+# Friend's ZeroTier IP (example: 169.254.100.50)
+# Download from friend's server over ZeroTier VPN
+python client.py 169.254.100.50 8080 /subdirectory/book1.pdf ./content
+
+# Your friend accesses your server using your ZeroTier IP
+# Friend runs: python client.py 169.254.229.90 8080 /document.pdf ./downloads
 ```
 
-### 9.3 Network Discovery Commands
+### 9.3 ZeroTier Network Discovery
+
+**How Friends Connect to Your Server:**
+1. **Share your ZeroTier IP:** `169.254.229.90:8080`
+2. **Friend uses browser:** `http://169.254.229.90:8080`
+3. **Friend uses client:** `python client.py 169.254.229.90 8080 /path ./downloads`
+
+**How You Connect to Friend's Server:**
+1. **Get friend's ZeroTier IP** (they run `ipconfig` and find their ZeroTier adapter IP)
+2. **Access via browser:** `http://FRIEND_ZEROTIER_IP:8080`
+3. **Access via client:** `python client.py FRIEND_ZEROTIER_IP 8080 /path ./downloads`
+
+**Network Discovery Commands:**
 ```powershell
-# Scan network for other HTTP servers
-nmap -p 8080 192.168.1.0/24
+# Test connection to friend's ZeroTier IP
+Test-NetConnection -ComputerName FRIEND_ZEROTIER_IP -Port 8080
 
-# PowerShell network scanner
-1..254 | ForEach-Object {
-    $ip = "192.168.1.$_"
-    $result = Test-NetConnection -ComputerName $ip -Port 8080 -InformationLevel Quiet
-    if ($result) { Write-Host "$ip has port 8080 open" }
+# Scan ZeroTier network range (example)
+169..169 | ForEach-Object {
+    $ip = "169.254.$_"
+    $result = Test-NetConnection -ComputerName $ip -Port 8080 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if ($result) { Write-Host "$ip has HTTP server running" }
 }
+
+# Check all your network interfaces
+ipconfig | findstr "IPv4"
 ```
 
+**ZeroTier Network Benefits:**
+- Works across different physical networks (home, school, etc.)
+- No need to configure router port forwarding
+- Secure encrypted VPN tunnel
+- Friends can be anywhere in the world
+
+### 9.4 ZeroTier Connection Testing
+
+**Your Server Access Points:**
+```
+# For you (local testing):
+http://localhost:8080
+http://192.168.1.112:8080    # Local Wi-Fi network
+http://169.254.229.90:8080   # ZeroTier VPN
+
+# For friends (remote access):
+http://169.254.229.90:8080   # Your ZeroTier IP - share this!
+```
+
+**Test Commands:**
+```powershell
+# Test your server is accessible via ZeroTier
+python client.py 169.254.229.90 8080 /index.html ./downloads
+
+# Test friend's server (replace with their ZeroTier IP)
+python client.py 169.254.XXX.XXX 8080 /index.html ./downloads
+```
+
+**Friend Connection Example:**
+- **Your ZeroTier IP:** `169.254.229.90`
+- **Friend visits:** `http://169.254.229.90:8080`
+- **Friend downloads:** `python client.py 169.254.229.90 8080 /document.pdf ./downloads`
+
+
+![alt text](photo_1_2025-10-13_22-38-43.jpg)
+![text](photo_2_2025-10-13_22-38-43.jpg)
+![text](photo_3_2025-10-13_22-38-43.jpg)
 ---
 
 ## 10. Technical Implementation Details
