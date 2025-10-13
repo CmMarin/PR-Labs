@@ -1,7 +1,7 @@
 # Lab 1 Report: HTTP File Server with TCP Sockets
 
-**Student:** [Your Name]  
-**Course:** Computer Networks  
+**Student:** [Clima Marin FAF-231]  
+**Course:** Programare in Retea  
 **Date:** October 13, 2025  
 
 ## Project Overview
@@ -21,10 +21,6 @@ PR-Labs/
 ├── Dockerfile             # Docker image configuration
 ├── README.md              # Project documentation
 ├── NETWORK_SETUP.md       # Network configuration guide
-├── LAB_REPORT.md          # Detailed lab report
-├── test_demo.py           # Testing demonstration
-├── start-server.bat       # Windows batch startup script
-├── start-server.ps1       # PowerShell startup script
 ├── content/               # Content directory to serve
 │   ├── index.html         # Main HTML page with embedded image
 │   ├── image.png          # Sample PNG image
@@ -97,7 +93,7 @@ Building http-server
 Creating http-file-server ... done
 Attaching to http-file-server
 http-file-server | ============================================================
-http-file-server | DevPortal File Server - READY
+http-file-server | File Server - READY
 http-file-server | ============================================================
 http-file-server | Server binding: 0.0.0.0:8080
 http-file-server | Serving directory: /app/content
