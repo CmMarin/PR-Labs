@@ -1,0 +1,12 @@
+
+services:
+  http-server:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./content:/app/content:ro
+      - ./downloads:/app/downloads
+    command: python server.py /app/content
+    container_name: http-file-server
+    restart: unless-stopped

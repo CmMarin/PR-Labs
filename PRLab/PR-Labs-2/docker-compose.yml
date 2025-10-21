@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  http-server:
+    build: .
+    container_name: http-file-server-lab2
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./content:/app/content:ro
+      - ./downloads:/app/downloads
+    command:
+      - python
+      - server.py
+      - /app/content
+      - --counter-mode
+      - safe
+      - --delay
+      - "1.0"
+      - --counter-delay
+      - "0.0"
+      - --rate-limit
+      - "5"
+      - --rate-window
+      - "1.0"
+    restart: unless-stopped
