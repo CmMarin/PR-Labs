@@ -70,11 +70,10 @@ Common flags:
   ```
 
 ## 5. Evidence (Screenshots)
-Place the following captures in `PR-Labs-2/screenshots/` and reference them in the submission:
-1. **Counters in the browser** – directory listing showing per-path request counts (`counter_browser.png`). The `/subdirectory/` view records `about.html` at 57 hits while other entries stay at 0, demonstrating the per-resource counters update correctly under concurrent load.
-2. **Benchmark output (Lab 2)** – `benchmark` mode results for the concurrent server (`benchmark_lab2.png`). With 12 requests and 10 workers the threaded server finishes in ~1.0 s, but 7 requests are throttled, highlighting how concurrency interacts with the active rate limiter.
-3. **Benchmark output (Lab 1)** – `benchmark` mode results for the single-threaded baseline (`benchmark_lab1.png`). Even with five workers the run still takes ~7 s, confirming the lack of parallelism because every request waits for the lone handler.
-4. **Rate limiting summary** – console output from `rate` mode highlighting HTTP status codes (`rate_status_codes.png`). A 40-request burst yields 35 HTTP 429 responses versus 5 successes, matching the configured 5 req/s allowance.
+1. **Counters in the browser** – directory listing showing per-path request counts. The `/subdirectory/` view records `about.html` at 57 hits while other entries stay at 0, demonstrating the per-resource counters update correctly under concurrent load.![alt text](counter.png)
+2. **Benchmark output (Lab 2)** – `benchmark` mode results for the concurrent server. With 12 requests and 10 workers the threaded server finishes in ~1.0 s, but 7 requests are throttled, highlighting how concurrency interacts with the active rate limiter.![alt text](outputlab2.png)
+3. **Benchmark output (Lab 1)** – `benchmark` mode results for the single-threaded baseline . Even with five workers the run still takes ~7 s, confirming the lack of parallelism because every request waits for the lone handler.![alt text](outputlab1.png)
+4. **Rate limiting summary** – console output from `rate` mode highlighting HTTP status codes. A 40-request burst yields 35 HTTP 429 responses versus 5 successes, matching the configured 5 req/s allowance.![alt text](status.png)
 ## 5. Counter Race Condition Study
 1. Start the Lab 2 server in **naive** mode with a visible counter delay:
    ```powershell
@@ -149,4 +148,4 @@ python .\concurrency_test.py counter --requests 25 --workers 10 --target-path /i
 python .\concurrency_test.py rate --requests 40 --path /index.html --json
 ```
 
-With these steps and measurements, every Lab 2 requirement has been exercised, recorded, and demonstrated.*** End Patch
+With these steps and measurements, every Lab 2 requirement has been exercised, recorded, and demonstrated.
