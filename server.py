@@ -1,773 +1,517 @@
 #!/usr/bin/env python3
 """
-HTTP File Server - Lab 1
-A simple HTTP file server using TCP sockets that serves files from a specified directory.
-Supports HTML, PNG, and PDF files with directory listing capability.
+HTTP File Server - Lab 2
+Concurrent HTTP server with request counters and per-IP rate limiting.
 """
 
-import socket
+import argparse
+import math
 import os
+import socket
 import sys
+import threading
+import time
 import urllib.parse
-import mimetypes
+from collections import defaultdict, deque
 from datetime import datetime
 
 
 class HTTPServer:
-    def __init__(self, host='0.0.0.0', port=8080, root_dir='./content'):
+    def __init__(
+        self,
+        host='0.0.0.0',
+        port=8080,
+        root_dir='./content',
+        handler_delay=0.0,
+        use_counter_lock=True,
+        counter_delay=0.0,
+        rate_limit=5,
+        rate_window=1.0,
+    ):
         self.host = host
         self.port = port
         self.root_dir = os.path.abspath(root_dir)
-        
-        # Supported MIME types
+        self.handler_delay = max(0.0, handler_delay)
+        self.use_counter_lock = use_counter_lock
+        self.counter_delay = max(0.0, counter_delay)
+        self.rate_limit = max(1, rate_limit)
+        self.rate_window = max(0.1, rate_window)
+
         self.mime_types = {
             '.html': 'text/html',
             '.htm': 'text/html',
             '.png': 'image/png',
             '.pdf': 'application/pdf',
-            '.txt': 'text/plain'
+            '.txt': 'text/plain',
         }
-    
+
+        self.request_counts = defaultdict(int)
+        self.counter_lock = threading.Lock()
+        self.rate_lock = threading.Lock()
+        self.client_windows = defaultdict(deque)
+
     def get_local_ip(self):
-        """Get the local IP address"""
         try:
-            # Create a temporary socket to determine local IP
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                # Connect to a remote address (doesn't need to be reachable)
-                s.connect(('8.8.8.8', 80))
-                local_ip = s.getsockname()[0]
-            return local_ip
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(('8.8.8.8', 80))
+                return sock.getsockname()[0]
         except Exception:
             return '127.0.0.1'
-    
+
     def start(self):
-        """Start the HTTP server"""
-        # Create socket
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+
         try:
-            # Bind and listen
             server_socket.bind((self.host, self.port))
-            server_socket.listen(5)
-            
-            # Get local IP for network access
+            server_socket.listen(64)
+
             local_ip = self.get_local_ip()
-            
-            print("=" * 60)
-            print(f"DevPortal File Server - READY")
-            print("=" * 60)
-            print(f"Server binding: {self.host}:{self.port}")
-            print(f"Serving directory: {self.root_dir}")
+
+            print('=' * 60)
+            print('Concurrent File Server - READY')
+            print('=' * 60)
+            print(f'Server binding: {self.host}:{self.port}')
+            print(f'Serving directory: {self.root_dir}')
+            print(f'Handler delay: {self.handler_delay:.2f}s | Counter lock: {self.use_counter_lock}')
+            print(f'Rate limit: {self.rate_limit} requests/{self.rate_window:.2f}s')
             print()
-            print("Access URLs:")
-            print(f"  Local:   http://localhost:{self.port}")
-            print(f"  Network: http://{local_ip}:{self.port}")
+            print('Access URLs:')
+            print(f'  Local:   http://localhost:{self.port}')
+            print(f'  Network: http://{local_ip}:{self.port}')
             print()
-            print("Press Ctrl+C to stop the server")
-            print("=" * 60)
-            
+            print('Press Ctrl+C to stop the server')
+            print('=' * 60)
+
             while True:
-                # Accept client connection
                 client_socket, client_address = server_socket.accept()
-                print(f"Connection from {client_address}")
-                
-                try:
-                    self.handle_request(client_socket)
-                except Exception as e:
-                    print(f"Error handling request: {e}")
-                finally:
-                    client_socket.close()
-                    
+                worker = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket, client_address),
+                    daemon=True,
+                )
+                worker.start()
+
         except KeyboardInterrupt:
-            print("\nServer stopped by user")
-        except Exception as e:
-            print(f"Server error: {e}")
+            print('\nServer stopped by user')
+        except Exception as exc:
+            print(f'Server error: {exc}')
         finally:
             server_socket.close()
-    
-    def handle_request(self, client_socket):
-        """Handle HTTP request from client"""
-        # Receive request
-        request_data = client_socket.recv(1024).decode('utf-8')
+
+    def handle_client(self, client_socket, client_address):
+        try:
+            allowed, retry_after, remaining = self.check_rate_limit(client_address[0])
+            if not allowed:
+                headers = self.build_rate_headers(remaining=None)
+                headers['Retry-After'] = str(max(1, math.ceil(retry_after)))
+                self.send_error_response(
+                    client_socket,
+                    429,
+                    'Too Many Requests',
+                    message='Rate limit exceeded. Please retry later.',
+                    extra_headers=headers,
+                )
+                return
+
+            rate_headers = self.build_rate_headers(remaining)
+            self.handle_request(client_socket, client_address, rate_headers)
+
+        except Exception as exc:
+            print(f'Error handling connection {client_address}: {exc}')
+        finally:
+            client_socket.close()
+
+    def handle_request(self, client_socket, client_address, extra_headers):
+        request_data = client_socket.recv(4096).decode('utf-8', errors='ignore')
         if not request_data:
             return
-        
-        # Parse request
+
         request_lines = request_data.split('\n')
         request_line = request_lines[0].strip()
-        
         if not request_line:
             return
-        
-        # Parse HTTP method and path
+
         try:
-            method, path, version = request_line.split()
+            method, path, _ = request_line.split()
         except ValueError:
-            self.send_error_response(client_socket, 400, "Bad Request")
+            self.send_error_response(
+                client_socket,
+                400,
+                'Bad Request',
+                message='Malformed request line.',
+                extra_headers=extra_headers,
+            )
             return
-        
+
         if method != 'GET':
-            self.send_error_response(client_socket, 405, "Method Not Allowed")
+            self.send_error_response(
+                client_socket,
+                405,
+                'Method Not Allowed',
+                message='Only GET is supported.',
+                extra_headers=extra_headers,
+            )
             return
-        
-        print(f"Request: {method} {path}")
-        
-        # Decode URL path
+
+        print(f'Request from {client_address}: {method} {path}')
+
         path = urllib.parse.unquote(path)
-        
-        # Remove query parameters
         if '?' in path:
-            path = path.split('?')[0]
-        
-        # Handle root path
+            path = path.split('?', 1)[0]
+
+        if self.handler_delay:
+            time.sleep(self.handler_delay)
+
         if path == '/':
             path = '/index.html'
-        
-        # Get absolute file path
+
         file_path = os.path.join(self.root_dir, path.lstrip('/'))
         file_path = os.path.abspath(file_path)
-        
-        # Security check: ensure file is within root directory
+
         if not file_path.startswith(self.root_dir):
-            self.send_error_response(client_socket, 403, "Forbidden")
+            self.send_error_response(
+                client_socket,
+                403,
+                'Forbidden',
+                message='Access denied.',
+                extra_headers=extra_headers,
+            )
             return
-        
-        # Check if path exists
+
         if not os.path.exists(file_path):
-            self.send_error_response(client_socket, 404, "Not Found")
+            self.send_error_response(
+                client_socket,
+                404,
+                'Not Found',
+                message='The requested resource was not found.',
+                extra_headers=extra_headers,
+            )
             return
-        
-        # Handle directory
-        if os.path.isdir(file_path):
-            self.send_directory_listing(client_socket, file_path, path)
+
+        is_directory = os.path.isdir(file_path)
+        counter_key = self.normalize_counter_key(file_path, is_directory)
+        self.increment_counter(counter_key)
+
+        if is_directory:
+            self.send_directory_listing(client_socket, file_path, path, extra_headers)
         else:
-            # Handle file
-            self.send_file(client_socket, file_path)
-    
-    def send_file(self, client_socket, file_path):
-        """Send file to client"""
+            self.send_file(client_socket, file_path, extra_headers)
+
+    def send_file(self, client_socket, file_path, extra_headers):
         try:
-            # Get file extension and MIME type
             _, ext = os.path.splitext(file_path)
             content_type = self.mime_types.get(ext.lower(), 'application/octet-stream')
-            
-            # Check if file extension is supported
+
             if ext.lower() not in self.mime_types:
-                self.send_error_response(client_socket, 415, "Unsupported Media Type")
+                self.send_error_response(
+                    client_socket,
+                    415,
+                    'Unsupported Media Type',
+                    message='File type is not supported.',
+                    extra_headers=extra_headers,
+                )
                 return
-            
-            # Read file content
+
             if content_type.startswith('text/'):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                content_bytes = content.encode('utf-8')
+                with open(file_path, 'r', encoding='utf-8') as handle:
+                    content_bytes = handle.read().encode('utf-8')
             else:
-                with open(file_path, 'rb') as f:
-                    content_bytes = f.read()
-            
-            # Send response
-            response_headers = self.build_headers(200, "OK", content_type, len(content_bytes))
-            client_socket.send(response_headers.encode('utf-8'))
+                with open(file_path, 'rb') as handle:
+                    content_bytes = handle.read()
+
+            headers = self.build_headers(
+                200,
+                'OK',
+                content_type,
+                len(content_bytes),
+                extra_headers=extra_headers,
+            )
+            client_socket.send(headers.encode('utf-8'))
             client_socket.send(content_bytes)
-            
-            print(f"Sent file: {file_path} ({len(content_bytes)} bytes)")
-            
-        except Exception as e:
-            print(f"Error sending file {file_path}: {e}")
-            self.send_error_response(client_socket, 500, "Internal Server Error")
-    
-    def send_directory_listing(self, client_socket, dir_path, url_path):
-        """Send directory listing as HTML"""
+            print(f'Sent file: {file_path} ({len(content_bytes)} bytes)')
+
+        except Exception as exc:
+            print(f'Error sending file {file_path}: {exc}')
+            self.send_error_response(
+                client_socket,
+                500,
+                'Internal Server Error',
+                message='Unexpected server error.',
+                extra_headers=extra_headers,
+            )
+
+    def send_directory_listing(self, client_socket, dir_path, url_path, extra_headers):
         try:
-            # Get directory contents
             files = []
             dirs = []
-            
+
             for item in sorted(os.listdir(dir_path)):
                 item_path = os.path.join(dir_path, item)
                 if os.path.isdir(item_path):
                     dirs.append(item)
                 else:
                     files.append(item)
-            
-            # Build HTML content
-            html_content = self.build_directory_html(url_path, dirs, files)
+
+            dir_entries = []
+            for dir_name in dirs:
+                relative = os.path.join(dir_path, dir_name)
+                key = self.normalize_counter_key(relative, is_directory=True)
+                count = self.get_request_count(key)
+                href = url_path.rstrip('/') + '/' + dir_name + '/'
+                dir_entries.append((dir_name + '/', href, count))
+
+            file_entries = []
+            for file_name in files:
+                relative = os.path.join(dir_path, file_name)
+                key = self.normalize_counter_key(relative, is_directory=False)
+                count = self.get_request_count(key)
+                href = url_path.rstrip('/') + '/' + file_name if url_path != '/' else '/' + file_name
+                file_entries.append((file_name, href, count, self.get_file_type_display(file_name)))
+
+            html_content = self.build_directory_html(url_path, dir_entries, file_entries)
             content_bytes = html_content.encode('utf-8')
-            
-            # Send response
-            response_headers = self.build_headers(200, "OK", "text/html", len(content_bytes))
-            client_socket.send(response_headers.encode('utf-8'))
+
+            headers = self.build_headers(
+                200,
+                'OK',
+                'text/html',
+                len(content_bytes),
+                extra_headers=extra_headers,
+            )
+            client_socket.send(headers.encode('utf-8'))
             client_socket.send(content_bytes)
-            
-            print(f"Sent directory listing: {dir_path}")
-            
-        except Exception as e:
-            print(f"Error sending directory listing {dir_path}: {e}")
-            self.send_error_response(client_socket, 500, "Internal Server Error")
-    
-    def build_directory_html_old(self, url_path, dirs, files):
-        """Build HTML for directory listing"""
-        # Ensure url_path ends with /
+            print(f'Sent directory listing: {dir_path}')
+
+        except Exception as exc:
+            print(f'Error sending directory listing {dir_path}: {exc}')
+            self.send_error_response(
+                client_socket,
+                500,
+                'Internal Server Error',
+                message='Unexpected server error.',
+                extra_headers=extra_headers,
+            )
+
+    def build_directory_html(self, url_path, dir_entries, file_entries):
         if not url_path.endswith('/'):
             url_path += '/'
-        
-        html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>Directory: {url_path}</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        
-        body {{ 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-            color: #ffffff;
-            min-height: 100vh;
-            line-height: 1.6;
-        }}
-        
-        .container {{
-            max-width: 1000px;
-            margin: 0 auto;
-            padding: 40px 20px;
-        }}
-        
-        .header {{
-            text-align: center;
-            margin-bottom: 40px;
-            position: relative;
-        }}
-        
-        .header::before {{
-            content: '';
-            position: absolute;
-            top: -15px;
-            left: 50%;
-            transform: translateX(-50%);
-            width: 80px;
-            height: 3px;
-            background: linear-gradient(90deg, #8b5cf6, #a855f7, #c084fc);
-            border-radius: 2px;
-        }}
-        
-        h1 {{ 
-            font-size: 2.5rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, #8b5cf6, #c084fc, #ffffff);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin-bottom: 10px;
-            letter-spacing: -1px;
-        }}
-        
-        .controls {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin: 20px 0;
-            flex-wrap: wrap;
-            gap: 15px;
-        }}
-        
-        .path-display {{
-            background: rgba(139, 92, 246, 0.1);
-            border: 1px solid rgba(139, 92, 246, 0.3);
-            border-radius: 8px;
-            padding: 12px 16px;
-            font-family: 'Consolas', 'Monaco', monospace;
-            color: #c084fc;
-            font-size: 0.9rem;
-            flex: 1;
-            min-width: 200px;
-        }}
-        
-        .view-toggle {{
-            display: flex;
-            background: rgba(139, 92, 246, 0.1);
-            border: 1px solid rgba(139, 92, 246, 0.3);
-            border-radius: 8px;
-            overflow: hidden;
-        }}
-        
-        .toggle-btn {{
-            background: transparent;
-            border: none;
-            color: #c084fc;
-            padding: 10px 16px;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            font-size: 0.9rem;
-        }}
-        
-        .toggle-btn.active {{
-            background: rgba(139, 92, 246, 0.3);
-            color: #ffffff;
-        }}
-        
-        .toggle-btn:hover {{
-            background: rgba(139, 92, 246, 0.2);
-        }}
-        
-        .items-grid {{
-            display: none;
-            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-            gap: 20px;
-            margin: 30px 0;
-        }}
-        
-        .items-list {{
-            display: none;
-            margin: 30px 0;
-        }}
-        
-        .items-list.active {{
-            display: block;
-        }}
-        
-        .items-grid.active {{
-            display: grid;
-        }}
-        
-        .item-card {{
-            background: rgba(139, 92, 246, 0.08);
-            border: 1px solid rgba(139, 92, 246, 0.2);
-            border-radius: 12px;
-            padding: 20px;
-            transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
-        }}
-        
-        .item-row {{
-            display: flex;
-            align-items: center;
-            background: rgba(139, 92, 246, 0.08);
-            border: 1px solid rgba(139, 92, 246, 0.2);
-            border-radius: 8px;
-            padding: 15px 20px;
-            margin: 8px 0;
-            transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
-        }}
-        
-        .item-card::before, .item-row::before {{
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 2px;
-            background: linear-gradient(90deg, #8b5cf6, #a855f7);
-            transform: scaleX(0);
-            transition: transform 0.3s ease;
-        }}
-        
-        .item-card:hover, .item-row:hover {{
-            transform: translateY(-3px);
-            border-color: rgba(139, 92, 246, 0.4);
-            box-shadow: 0 10px 25px rgba(139, 92, 246, 0.15);
-        }}
-        
-        .item-card:hover::before, .item-row:hover::before {{
-            transform: scaleX(1);
-        }}
-        
-        .item-card a, .item-row a {{
-            text-decoration: none;
-            color: inherit;
-            display: block;
-        }}
-        
-        .item-row a {{
-            display: flex;
-            align-items: center;
-            width: 100%;
-        }}
-        
-        .item-icon {{
-            font-size: 2.2rem;
-            margin-bottom: 12px;
-            color: #8b5cf6;
-        }}
-        
-        .item-icon-small {{
-            font-size: 1.5rem;
-            color: #8b5cf6;
-            margin-right: 15px;
-            min-width: 25px;
-        }}
-        
-        .item-name {{
-            color: #ffffff;
-            font-weight: 600;
-            font-size: 1.1rem;
-            margin-bottom: 8px;
-            word-break: break-word;
-        }}
-        
-        .item-name-small {{
-            color: #ffffff;
-            font-weight: 600;
-            font-size: 1rem;
-            flex: 1;
-        }}
-        
-        .item-type {{
-            color: #a5b4fc;
-            font-size: 0.9rem;
-            text-transform: capitalize;
-        }}
-        
-        .item-type-small {{
-            color: #a5b4fc;
-            font-size: 0.8rem;
-            text-transform: capitalize;
-            min-width: 80px;
-            text-align: right;
-        }}
-        
-        .directory {{ 
-            border-left: 3px solid #8b5cf6;
-        }}
-        
-        .file {{ 
-            border-left: 3px solid #c084fc;
-        }}
-        
-        .footer {{
-            text-align: center;
-            margin-top: 50px;
-            padding-top: 25px;
-            border-top: 1px solid rgba(139, 92, 246, 0.2);
-            color: #a5b4fc;
-            font-style: italic;
-        }}
-        
-        .status-info {{
-            background: rgba(16, 33, 62, 0.6);
-            border: 1px solid rgba(139, 92, 246, 0.2);
-            border-radius: 10px;
-            padding: 20px;
-            margin: 30px 0;
-            text-align: center;
-        }}
-        
-        .status-info span {{
-            color: #c084fc;
-            font-weight: 500;
-        }}
-    </style>
-    <script>
-        function toggleView(viewType) {{
-            const gridView = document.querySelector('.items-grid');
-            const listView = document.querySelector('.items-list');
-            const gridBtn = document.querySelector('[data-view="grid"]');
-            const listBtn = document.querySelector('[data-view="list"]');
-            
-            if (viewType === 'grid') {{
-                gridView.classList.add('active');
-                listView.classList.remove('active');
-                gridBtn.classList.add('active');
-                listBtn.classList.remove('active');
-            }} else {{
-                gridView.classList.remove('active');
-                listView.classList.add('active');
-                gridBtn.classList.remove('active');
-                listBtn.classList.add('active');
-            }}
-        }}
-        
-        // Set default view on load
-        document.addEventListener('DOMContentLoaded', function() {{
-            toggleView('grid');
-        }});
-    </script>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Directory Hub</h1>
-        </div>
-        
-        <div class="controls">
-            <div class="path-display">
-                Current Path: {url_path}
-            </div>
-            <div class="view-toggle">
-                <button class="toggle-btn active" data-view="grid" onclick="toggleView('grid')">[+] Grid</button>
-                <button class="toggle-btn" data-view="list" onclick="toggleView('list')">[=] List</button>
-            </div>
-        </div>
-        
-        <div class="items-grid active">
-"""
-        
-        # Add parent directory link if not root
-        list_items = ""
+
+        html = [
+            '<!DOCTYPE html>',
+            '<html>',
+            '<head>',
+            f'    <title>Directory: {url_path}</title>',
+            '    <style>',
+            '        body { font-family: Arial; margin: 20px; background: white; color: black; }',
+            '        a { color: blue; text-decoration: none; }',
+            '        a:hover { text-decoration: underline; }',
+            '        .path { background: #f0f0f0; padding: 10px; margin: 10px 0; }',
+            '        ul { list-style: none; padding: 0; }',
+            '        li { margin: 5px 0; padding: 5px; border-bottom: 1px solid #ddd; }',
+            '        .count { color: #333; font-size: 0.85rem; margin-left: 10px; }',
+            '    </style>',
+            '</head>',
+            '<body>',
+            '    <h1>Directory Listing</h1>',
+            f'    <div class="path">Path: {url_path}</div>',
+            '    <ul>',
+        ]
+
         if url_path != '/':
             parent_path = '/'.join(url_path.rstrip('/').split('/')[:-1]) + '/'
-            if parent_path == '/':
+            if parent_path == '//':
                 parent_path = '/'
-            html += f"""            <div class="item-card directory">
-                <a href="{parent_path}">
-                    <div class="item-icon">&lt;</div>
-                    <div class="item-name">Parent Directory</div>
-                    <div class="item-type">navigation</div>
-                </a>
-            </div>
-"""
-            list_items += f"""            <div class="item-row directory">
-                <a href="{parent_path}">
-                    <div class="item-icon-small">&lt;</div>
-                    <div class="item-name-small">Parent Directory</div>
-                    <div class="item-type-small">navigation</div>
-                </a>
-            </div>
-"""
-        
-        # Add directories
-        for dir_name in dirs:
-            dir_url = url_path + dir_name + '/'
-            html += f"""            <div class="item-card directory">
-                <a href="{dir_url}">
-                    <div class="item-icon">[D]</div>
-                    <div class="item-name">{dir_name}/</div>
-                    <div class="item-type">directory</div>
-                </a>
-            </div>
-"""
-            list_items += f"""            <div class="item-row directory">
-                <a href="{dir_url}">
-                    <div class="item-icon-small">[D]</div>
-                    <div class="item-name-small">{dir_name}/</div>
-                    <div class="item-type-small">directory</div>
-                </a>
-            </div>
-"""
-        
-        # Add files
-        for file_name in files:
-            file_url = url_path + file_name
-            file_icon = self.get_file_icon(file_name)
-            file_type = self.get_file_type_display(file_name)
-            html += f"""            <div class="item-card file">
-                <a href="{file_url}">
-                    <div class="item-icon">{file_icon}</div>
-                    <div class="item-name">{file_name}</div>
-                    <div class="item-type">{file_type}</div>
-                </a>
-            </div>
-"""
-            list_items += f"""            <div class="item-row file">
-                <a href="{file_url}">
-                    <div class="item-icon-small">{file_icon}</div>
-                    <div class="item-name-small">{file_name}</div>
-                    <div class="item-type-small">{file_type}</div>
-                </a>
-            </div>
-"""
-        
-        html += f"""        </div>
-        
-        <div class="items-list">
-{list_items}        </div>
-        
-        <div class="status-info">
-            <span>DevPortal File Server</span> | Directory listing active
-        </div>
-        
-        <div class="footer">
-            <p>Network File Server Infrastructure</p>
-        </div>
-    </div>
-</body>
-</html>"""
-        
-        return html
-    
-    def build_directory_html(self, url_path, dirs, files):
-        """Build minimal HTML for directory listing"""
-        # Ensure url_path ends with /
-        if not url_path.endswith('/'):
-            url_path += '/'
-        
-        html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>Directory: {url_path}</title>
-    <style>
-        body {{
-            font-family: Arial;
-            margin: 20px;
-            background: white;
-            color: black;
-        }}
-        a {{
-            color: blue;
-            text-decoration: none;
-        }}
-        a:hover {{
-            text-decoration: underline;
-        }}
-        .path {{
-            background: #f0f0f0;
-            padding: 10px;
-            margin: 10px 0;
-        }}
-        ul {{
-            list-style: none;
-            padding: 0;
-        }}
-        li {{
-            margin: 5px 0;
-            padding: 5px;
-            border-bottom: 1px solid #ddd;
-        }}
-    </style>
-</head>
-<body>
-    <h1>Directory Listing</h1>
-    <div class="path">Path: {url_path}</div>
-    <ul>
-"""
-        
-        # Add parent directory link if not root
-        if url_path != '/':
-            parent_path = '/'.join(url_path.rstrip('/').split('/')[:-1]) + '/'
-            if parent_path == '/':
-                parent_path = '/'
-            html += f'        <li><a href="{parent_path}">.. (Parent Directory)</a></li>\n'
-        
-        # Add directories
-        for dir_name in dirs:
-            dir_url = url_path + dir_name + '/'
-            html += f'        <li><a href="{dir_url}">{dir_name}/</a> - Directory</li>\n'
-        
-        # Add files
-        for file_name in files:
-            file_url = url_path + file_name
-            file_type = self.get_file_type_display(file_name)
-            html += f'        <li><a href="{file_url}">{file_name}</a> - {file_type}</li>\n'
-        
-        html += """    </ul>
-    <p>File Server</p>
-</body>
-</html>"""
-        
-        return html
-    
-    def get_file_icon(self, filename):
-        """Get icon for file type"""
-        _, ext = os.path.splitext(filename)
-        ext = ext.lower()
-        
-        icons = {
-            '.html': '[H]',
-            '.htm': '[H]',
-            '.png': '[I]',
-            '.pdf': '[P]',
-            '.txt': '[T]'
-        }
-        
-        return icons.get(ext, '[F]')
-    
+            html.append(f'        <li><a href="{parent_path}">.. (Parent Directory)</a></li>')
+
+        for name, href, count in dir_entries:
+            html.append(
+                f'        <li><a href="{href}">{name}</a> - Directory <span class="count">Requests: {count}</span></li>'
+            )
+
+        for name, href, count, file_type in file_entries:
+            html.append(
+                f'        <li><a href="{href}">{name}</a> - {file_type} <span class="count">Requests: {count}</span></li>'
+            )
+
+        html.extend([
+            '    </ul>',
+            '    <p>Concurrent File Server</p>',
+            '</body>',
+            '</html>',
+        ])
+
+        return '\n'.join(html)
+
     def get_file_type_display(self, filename):
-        """Get file type display name"""
         _, ext = os.path.splitext(filename)
         ext = ext.lower()
-        
+
         types = {
             '.html': 'webpage',
             '.htm': 'webpage',
             '.png': 'image',
             '.pdf': 'document',
-            '.txt': 'text'
+            '.txt': 'text',
         }
-        
+
         return types.get(ext, 'file')
-    
-    def send_error_response(self, client_socket, status_code, status_text):
-        """Send HTTP error response"""
-        html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>Error {status_code}</title>
-    <style>
-        body {{
-            font-family: Arial;
-            margin: 20px;
-            background: white;
-            color: black;
-            text-align: center;
-        }}
-        a {{
-            color: blue;
-            text-decoration: none;
-        }}
-        a:hover {{
-            text-decoration: underline;
-        }}
-    </style>
-</head>
-<body>
-    <h1>Error {status_code}</h1>
-    <h2>{status_text}</h2>
-    <p>The requested resource could not be found.</p>
-    <p><a href="/">Back to Home</a></p>
-    <p>File Server</p>
-</body>
-</html>"""
-        
-        content_bytes = html_content.encode('utf-8')
-        response_headers = self.build_headers(status_code, status_text, "text/html", len(content_bytes))
-        
+
+    def send_error_response(self, client_socket, status_code, status_text, message=None, extra_headers=None):
+        body = [
+            '<!DOCTYPE html>',
+            '<html>',
+            '<head>',
+            f'    <title>Error {status_code}</title>',
+            '    <style>',
+            '        body { font-family: Arial; margin: 20px; background: white; color: black; text-align: center; }',
+            '        a { color: blue; text-decoration: none; }',
+            '        a:hover { text-decoration: underline; }',
+            '    </style>',
+            '</head>',
+            '<body>',
+            f'    <h1>Error {status_code}</h1>',
+            f'    <h2>{status_text}</h2>',
+            f'    <p>{message or "Unable to process the request."}</p>',
+            '    <p><a href="/">Back to Home</a></p>',
+            '    <p>Concurrent File Server</p>',
+            '</body>',
+            '</html>',
+        ]
+        content_bytes = '\n'.join(body).encode('utf-8')
+        headers = self.build_headers(
+            status_code,
+            status_text,
+            'text/html',
+            len(content_bytes),
+            extra_headers=extra_headers,
+        )
+
         try:
-            client_socket.send(response_headers.encode('utf-8'))
+            client_socket.send(headers.encode('utf-8'))
             client_socket.send(content_bytes)
-            print(f"Sent error response: {status_code} {status_text}")
-        except:
+            print(f'Sent error response: {status_code} {status_text}')
+        except Exception:
             pass
-    
-    def build_headers(self, status_code, status_text, content_type, content_length):
-        """Build HTTP response headers"""
-        headers = f"""HTTP/1.1 {status_code} {status_text}\r
-Date: {datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')}\r
-Server: HTTPServer/1.0\r
-Content-Type: {content_type}\r
-Content-Length: {content_length}\r
-Connection: close\r
-\r
-"""
+
+    def build_headers(self, status_code, status_text, content_type, content_length, extra_headers=None):
+        lines = [
+            f'HTTP/1.1 {status_code} {status_text}',
+            f'Date: {datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")}',
+            'Server: ConcurrentHTTPServer/2.0',
+            f'Content-Type: {content_type}',
+            f'Content-Length: {content_length}',
+            'Connection: close',
+        ]
+
+        if extra_headers:
+            for key, value in extra_headers.items():
+                lines.append(f'{key}: {value}')
+
+        lines.append('')
+        lines.append('')
+        return '\r\n'.join(lines)
+
+    def normalize_counter_key(self, absolute_path, is_directory):
+        relative = os.path.relpath(absolute_path, self.root_dir)
+        relative = relative.replace('\\', '/')
+        if relative in ('.', ''):
+            relative = ''
+        if not relative.startswith('/'):
+            relative = '/' + relative if relative else '/'
+        if is_directory and not relative.endswith('/'):
+            relative += '/'
+        if not is_directory and relative.endswith('/'):
+            relative = relative.rstrip('/')
+        return relative or '/'
+
+    def increment_counter(self, key):
+        if self.use_counter_lock:
+            with self.counter_lock:
+                if self.counter_delay:
+                    time.sleep(self.counter_delay)
+                self.request_counts[key] += 1
+        else:
+            current = self.request_counts[key]
+            if self.counter_delay:
+                time.sleep(self.counter_delay)
+            self.request_counts[key] = current + 1
+
+    def get_request_count(self, key):
+        if self.use_counter_lock:
+            with self.counter_lock:
+                return self.request_counts.get(key, 0)
+        return self.request_counts.get(key, 0)
+
+    def check_rate_limit(self, client_ip):
+        now = time.time()
+        with self.rate_lock:
+            window = self.client_windows[client_ip]
+            while window and now - window[0] > self.rate_window:
+                window.popleft()
+            if len(window) >= self.rate_limit:
+                retry_after = self.rate_window - (now - window[0]) if window else self.rate_window
+                return False, max(0.0, retry_after), self.rate_limit - len(window)
+            window.append(now)
+            remaining = self.rate_limit - len(window)
+            return True, 0.0, remaining
+
+    def build_rate_headers(self, remaining):
+        headers = {
+            'X-RateLimit-Limit': str(self.rate_limit),
+            'X-RateLimit-Window': f'{self.rate_window:.2f}',
+        }
+        if remaining is not None:
+            headers['X-RateLimit-Remaining'] = str(max(0, remaining))
         return headers
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Concurrent HTTP file server for Lab 2.')
+    parser.add_argument('directory', help='Directory to serve.')
+    parser.add_argument('--host', default='0.0.0.0', help='Interface to bind. Default: 0.0.0.0')
+    parser.add_argument('--port', type=int, default=8080, help='Port to bind. Default: 8080')
+    parser.add_argument('--delay', type=float, default=0.0, help='Artificial handler delay in seconds.')
+    parser.add_argument(
+        '--counter-mode',
+        choices=['safe', 'naive'],
+        default='safe',
+        help='Use thread-safe counters (safe) or deliberately unsafe counters (naive).',
+    )
+    parser.add_argument(
+        '--counter-delay',
+        type=float,
+        default=0.0,
+        help='Artificial delay when updating counters to highlight races.',
+    )
+    parser.add_argument('--rate-limit', type=int, default=5, help='Allowed requests per window per IP.')
+    parser.add_argument('--rate-window', type=float, default=1.0, help='Window size in seconds for rate limiting.')
+    return parser.parse_args()
+
+
 def main():
-    """Main function"""
-    if len(sys.argv) != 2:
-        print("Usage: python server.py <directory_to_serve>")
+    args = parse_args()
+
+    if not os.path.exists(args.directory):
+        print(f"Error: Directory '{args.directory}' does not exist")
         sys.exit(1)
-    
-    directory = sys.argv[1]
-    
-    if not os.path.exists(directory):
-        print(f"Error: Directory '{directory}' does not exist")
+
+    if not os.path.isdir(args.directory):
+        print(f"Error: '{args.directory}' is not a directory")
         sys.exit(1)
-    
-    if not os.path.isdir(directory):
-        print(f"Error: '{directory}' is not a directory")
-        sys.exit(1)
-    
-    # Create and start server
-    server = HTTPServer(root_dir=directory)
+
+    server = HTTPServer(
+        host=args.host,
+        port=args.port,
+        root_dir=args.directory,
+        handler_delay=args.delay,
+        use_counter_lock=(args.counter_mode == 'safe'),
+        counter_delay=args.counter_delay,
+        rate_limit=args.rate_limit,
+        rate_window=args.rate_window,
+    )
     server.start()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
